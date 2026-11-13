@@ -5548,12 +5548,18 @@ jobs:
                   }
               }
 
-              fun capture(t: BrowserTab, attempt: Int = 0) {
-                  val wv = t.session ?: return
-                  if (home || current !== t) return
-                  val act = Web.act ?: return
+              @Volatile var browserVisible = true
+
+              fun capture(t: BrowserTab, attempt: Int = 0, onDone: (() -> Unit)? = null) {
+                  val wv = t.session
+                  val act = Web.act
+                  if (wv == null || act == null || home || current !== t || !browserVisible) {
+                      onDone?.invoke()
+                      return
+                  }
                   if (wv.width <= 0 || wv.height <= 0 || wv.parent == null || !wv.isShown) {
-                      if (attempt < 3) main.postDelayed({ capture(t, attempt + 1) }, 1000)
+                      if (onDone == null && attempt < 3) main.postDelayed({ capture(t, attempt + 1) }, 1000)
+                      onDone?.invoke()
                       return
                   }
                   try {
@@ -5563,16 +5569,23 @@ jobs:
                       val rect = android.graphics.Rect(loc[0], loc[1], loc[0] + side, loc[1] + side)
                       val bmp = Bitmap.createBitmap(side, side, Bitmap.Config.ARGB_8888)
                       android.view.PixelCopy.request(act.window, rect, bmp, { res ->
-                          if (res != android.view.PixelCopy.SUCCESS) {
-                              if (attempt < 3) main.postDelayed({ capture(t, attempt + 1) }, 1000)
-                          } else if (blankBmp(bmp) && attempt < 3) {
-                              main.postDelayed({ capture(t, attempt + 1) }, 1200)
+                          val still = browserVisible && !home && current === t && t.session === wv
+                          if (res != android.view.PixelCopy.SUCCESS || !still) {
+                              if (onDone == null && attempt < 3) main.postDelayed({ capture(t, attempt + 1) }, 1000)
+                          } else if (blankBmp(bmp)) {
+                              if (onDone == null && attempt < 3) {
+                                  main.postDelayed({ capture(t, attempt + 1) }, 1200)
+                              } else if (onDone == null) {
+                                  saveThumb(t, bmp)
+                              }
                           } else {
                               saveThumb(t, bmp)
                           }
+                          onDone?.invoke()
                       }, main)
                   } catch (e: Exception) {
                       Log.d("GreyScript", "capture threw: " + e)
+                      onDone?.invoke()
                   }
               }
 
@@ -6040,6 +6053,8 @@ jobs:
           import org.json.JSONArray
           import org.json.JSONObject
           import android.widget.FrameLayout
+          import androidx.compose.foundation.text.selection.LocalTextSelectionColors
+          import androidx.compose.foundation.text.selection.TextSelectionColors
 
           val BG = Color(0xFF1E1E1E)
           val Bar = Color(0xFF2A2A2A)
@@ -6214,7 +6229,14 @@ jobs:
                       onSurface = Color.White
                   )
               ) {
+                  CompositionLocalProvider(
+                      LocalTextSelectionColors provides TextSelectionColors(
+                          handleColor = Color.White,
+                          backgroundColor = Color.Black
+                      )
+                  ) {
                   var screen by remember { mutableStateOf("browser") }
+                  SideEffect { tabs.browserVisible = screen == "browser" }
                   var editId by remember { mutableStateOf<String?>(null) }
                   var startEdit by remember { mutableStateOf(false) }
                   DownloadAsk()
@@ -6327,6 +6349,7 @@ jobs:
                           }
                       }
                   }
+              }
               }
           }
 
@@ -6639,8 +6662,8 @@ jobs:
                                   .clip(RoundedCornerShape(10.dp))
                                   .background(Field)
                                   .clickable {
-                                      cur?.let { tabs.capture(it) }
-                                      onTabs()
+                                      val cc = cur
+                                      if (cc != null) tabs.capture(cc, 0) { onTabs() } else onTabs()
                                   },
                               contentAlignment = Alignment.Center
                           ) {
