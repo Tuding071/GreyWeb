@@ -1708,6 +1708,7 @@ jobs:
 
           import androidx.compose.animation.core.Animatable
           import androidx.compose.animation.core.CubicBezierEasing
+          import androidx.compose.animation.core.LinearEasing
           import androidx.compose.animation.core.tween
           import androidx.compose.foundation.background
           import androidx.compose.foundation.gestures.detectTapGestures
@@ -1722,57 +1723,26 @@ jobs:
           import androidx.compose.runtime.mutableStateListOf
           import androidx.compose.runtime.mutableStateOf
           import androidx.compose.runtime.remember
+          import androidx.compose.runtime.rememberCoroutineScope
           import androidx.compose.runtime.setValue
           import androidx.compose.ui.Modifier
-          import androidx.compose.ui.draw.drawBehind
-          import androidx.compose.ui.draw.drawWithContent
-          import androidx.compose.ui.geometry.CornerRadius
-          import androidx.compose.ui.geometry.Offset
-          import androidx.compose.ui.geometry.Rect
-          import androidx.compose.ui.geometry.RoundRect
-          import androidx.compose.ui.geometry.Size
-          import androidx.compose.ui.graphics.ClipOp
-          import androidx.compose.ui.graphics.FilterQuality
-          import androidx.compose.ui.graphics.Outline
-          import androidx.compose.ui.graphics.Path
-          import androidx.compose.ui.graphics.Shape
-          import androidx.compose.ui.graphics.drawscope.clipPath
           import androidx.compose.ui.graphics.graphicsLayer
           import androidx.compose.ui.input.pointer.pointerInput
-          import androidx.compose.ui.layout.onGloballyPositioned
-          import androidx.compose.ui.layout.positionInWindow
-          import androidx.compose.ui.unit.Density
-          import androidx.compose.ui.unit.IntOffset
-          import androidx.compose.ui.unit.IntSize
-          import androidx.compose.ui.unit.LayoutDirection
-          import androidx.compose.ui.unit.dp
-          import androidx.compose.ui.util.lerp
+          import kotlinx.coroutines.launch
 
           sealed class ExitMode {
               object Back : ExitMode()
-              object NewTab : ExitMode()
-              class Card(val tabId: Int) : ExitMode()
+              object Fade : ExitMode()
           }
 
-          // Shared geometry (window coordinates) captured by the buttons and cards, read only in draw phase.
           object Motion {
-              var tabsBtn: Rect = Rect.Zero
-              var newBtn: Rect = Rect.Zero
-              val cardRects = HashMap<Int, Rect>()
-              var origin: Offset = Offset.Zero
+              // 1 = browser fully shown; below 1 it is faded and slightly small (used when opening a tab / new tab)
+              val browserIn = Animatable(1f)
               var exit: ExitMode = ExitMode.Back
           }
 
           private val Decel = CubicBezierEasing(0.05f, 0.7f, 0.1f, 1f)
           private val Accel = CubicBezierEasing(0.3f, 0f, 0.8f, 0.15f)
-
-          private class RevealShape(
-              val l: Float, val t: Float, val r: Float, val b: Float, val rad: Float
-          ) : Shape {
-              override fun createOutline(size: Size, layoutDirection: LayoutDirection, density: Density): Outline {
-                  return Outline.Rounded(RoundRect(l, t, r, b, CornerRadius(rad, rad)))
-              }
-          }
 
           private fun depthOf(n: String): Int = when (n) {
               "editor", "guide", "filterguide" -> 2
@@ -1783,7 +1753,6 @@ jobs:
           class OvLayer(val name: String) {
               val p = Animatable(0f)
               val ex = Animatable(0f)
-              val sf = Animatable(1f)
               var exiting by mutableStateOf(false)
               var exit: ExitMode = ExitMode.Back
           }
@@ -1795,6 +1764,7 @@ jobs:
               content: @Composable (String) -> Unit
           ) {
               val layers = remember { mutableStateListOf<OvLayer>() }
+              val scope = rememberCoroutineScope()
               SideEffect { tabs.browserVisible = layers.isEmpty() }
               LaunchedEffect(screen) {
                   val live = layers.filter { !it.exiting }
@@ -1805,6 +1775,7 @@ jobs:
                           l.exiting = true
                       }
                   } else {
+                      Motion.browserIn.snapTo(1f)
                       val idx = live.indexOfFirst { it.name == screen }
                       if (idx >= 0) {
                           for (i in idx + 1 until live.size) {
@@ -1824,14 +1795,14 @@ jobs:
                   }
                   Motion.exit = ExitMode.Back
               }
-              Box(
-                  Modifier
-                      .fillMaxSize()
-                      .onGloballyPositioned { Motion.origin = it.positionInWindow() }
-              ) {
+              Box(Modifier.fillMaxSize()) {
                   for (l in layers) {
                       key(l) {
-                          LayerView(l, tabs, layers) { content(l.name) }
+                          LayerView(
+                              l,
+                              layers,
+                              { scope.launch { Motion.browserIn.animateTo(1f, tween(190, easing = Decel)) } }
+                          ) { content(l.name) }
                       }
                   }
               }
@@ -1840,30 +1811,27 @@ jobs:
           @Composable
           private fun LayerView(
               l: OvLayer,
-              tabs: TabManager,
               layers: MutableList<OvLayer>,
+              startBrowserIn: () -> Unit,
               body: @Composable () -> Unit
           ) {
-              val isTabs = l.name == "tabs"
+              val fromLeft = l.name == "tabs"
               LaunchedEffect(l) {
                   if (!l.exiting) {
-                      l.p.animateTo(1f, tween(if (isTabs) 260 else 240, easing = Decel))
+                      l.p.animateTo(1f, tween(240, easing = Decel))
                   }
               }
               LaunchedEffect(l.exiting) {
                   if (!l.exiting) return@LaunchedEffect
-                  val mode = l.exit
-                  if (isTabs && mode is ExitMode.Card) {
-                      l.ex.animateTo(1f, tween(250, easing = Decel))
-                      l.sf.animateTo(0f, tween(130))
-                  } else if (isTabs && mode is ExitMode.NewTab) {
-                      l.ex.animateTo(1f, tween(260, easing = Decel))
+                  if (l.exit is ExitMode.Fade) {
+                      Motion.browserIn.snapTo(0f)
+                      l.ex.animateTo(1f, tween(100, easing = LinearEasing))
+                      startBrowserIn()
                   } else {
-                      l.p.animateTo(0f, tween(if (isTabs) 220 else 200, easing = Accel))
+                      l.p.animateTo(0f, tween(200, easing = Accel))
                   }
                   layers.remove(l)
               }
-              val cardMode = l.exit
               Box(
                   Modifier
                       .fillMaxSize()
@@ -1873,119 +1841,16 @@ jobs:
                       Modifier
                           .fillMaxSize()
                           .graphicsLayer {
-                              val w = size.width
-                              val h = size.height
-                              val mode = l.exit
-                              if (isTabs) {
-                                  if (l.exiting && mode is ExitMode.Card) {
-                                      alpha = (1f - l.ex.value * 1.25f).coerceIn(0f, 1f)
-                                  } else if (l.exiting && mode is ExitMode.NewTab) {
-                                      alpha = 1f
-                                  } else {
-                                      val p = l.p.value
-                                      val b = Motion.tabsBtn
-                                      if (b.width > 0f && b.height > 0f) {
-                                          val o = Motion.origin
-                                          clip = true
-                                          shape = RevealShape(
-                                              lerp(b.left - o.x, 0f, p),
-                                              lerp(b.top - o.y, 0f, p),
-                                              lerp(b.right - o.x, w, p),
-                                              lerp(b.bottom - o.y, h, p),
-                                              lerp(10.dp.toPx(), 0f, p)
-                                          )
-                                          alpha = (p * 4f).coerceIn(0f, 1f)
-                                      } else {
-                                          alpha = p
-                                      }
-                                  }
+                              if (l.exiting && l.exit is ExitMode.Fade) {
+                                  alpha = 1f - l.ex.value
                               } else {
-                                  translationX = (1f - l.p.value) * w
-                              }
-                          }
-                          .drawWithContent {
-                              val mode = l.exit
-                              if (isTabs && l.exiting && mode is ExitMode.NewTab) {
-                                  val e = l.ex.value
-                                  val b = Motion.newBtn
-                                  if (b.width > 0f && b.height > 0f) {
-                                      val o = Motion.origin
-                                      val hole = Path()
-                                      hole.addRoundRect(
-                                          RoundRect(
-                                              lerp(b.left - o.x, 0f, e),
-                                              lerp(b.top - o.y, 0f, e),
-                                              lerp(b.right - o.x, size.width, e),
-                                              lerp(b.bottom - o.y, size.height, e),
-                                              CornerRadius(lerp(b.width / 2f, 0f, e))
-                                          )
-                                      )
-                                      clipPath(hole, ClipOp.Difference) {
-                                          this@drawWithContent.drawContent()
-                                      }
-                                  } else {
-                                      drawContent()
-                                  }
-                              } else {
-                                  drawContent()
+                                  val w = size.width
+                                  translationX = if (fromLeft) -(1f - l.p.value) * w else (1f - l.p.value) * w
                               }
                           }
                           .background(BG)
                   ) {
                       body()
-                  }
-                  if (isTabs && l.exiting && cardMode is ExitMode.Card) {
-                      val id = cardMode.tabId
-                      val thumb = tabs.tabs.firstOrNull { it.id == id }?.thumb
-                      Box(
-                          Modifier
-                              .fillMaxSize()
-                              .graphicsLayer { alpha = l.sf.value }
-                              .drawBehind {
-                                  val e = l.ex.value
-                                  val w = size.width
-                                  val h = size.height
-                                  val c = Motion.cardRects[id]
-                                  val o = Motion.origin
-                                  val r0 = if (c != null) c.translate(-o.x, -o.y) else Rect(w / 2f - 20f, h / 2f - 20f, w / 2f + 20f, h / 2f + 20f)
-                                  val left = lerp(r0.left, 0f, e)
-                                  val top = lerp(r0.top, 0f, e)
-                                  val right = lerp(r0.right, w, e)
-                                  val bottom = lerp(r0.bottom, h, e)
-                                  val rad = lerp(8.dp.toPx(), 0f, e)
-                                  val path = Path()
-                                  path.addRoundRect(RoundRect(left, top, right, bottom, CornerRadius(rad, rad)))
-                                  clipPath(path) {
-                                      drawRect(Bar, Offset(left, top), Size(right - left, bottom - top))
-                                      if (thumb != null) {
-                                          val dw = right - left
-                                          val dh = bottom - top
-                                          if (dw > 1f && dh > 1f) {
-                                              val s = minOf(thumb.width, thumb.height)
-                                              val aspect = dw / dh
-                                              val sw: Int
-                                              val sh: Int
-                                              if (aspect >= 1f) {
-                                                  sw = s
-                                                  sh = (s / aspect).toInt().coerceAtLeast(1)
-                                              } else {
-                                                  sh = s
-                                                  sw = (s * aspect).toInt().coerceAtLeast(1)
-                                              }
-                                              val sx = ((thumb.width - sw) / 2).coerceAtLeast(0)
-                                              drawImage(
-                                                  thumb,
-                                                  srcOffset = IntOffset(sx, 0),
-                                                  srcSize = IntSize(sw, sh),
-                                                  dstOffset = IntOffset(left.toInt(), top.toInt()),
-                                                  dstSize = IntSize(dw.toInt(), dh.toInt()),
-                                                  filterQuality = FilterQuality.Low
-                                              )
-                                          }
-                                      }
-                                  }
-                              }
-                      )
                   }
               }
           }
@@ -5841,7 +5706,7 @@ jobs:
               fun capture(t: BrowserTab, attempt: Int = 0, onDone: (() -> Unit)? = null) {
                   val wv = t.session
                   val act = Web.act
-                  if (wv == null || act == null || home || current !== t || !browserVisible) {
+                  if (wv == null || act == null || home || current !== t || !browserVisible || Motion.browserIn.value < 1f) {
                       onDone?.invoke()
                       return
                   }
@@ -5857,7 +5722,7 @@ jobs:
                       val rect = android.graphics.Rect(loc[0], loc[1], loc[0] + side, loc[1] + side)
                       val bmp = Bitmap.createBitmap(side, side, Bitmap.Config.ARGB_8888)
                       android.view.PixelCopy.request(act.window, rect, bmp, { res ->
-                          val still = browserVisible && !home && current === t && t.session === wv
+                          val still = browserVisible && !home && current === t && t.session === wv && Motion.browserIn.value >= 1f
                           if (res != android.view.PixelCopy.SUCCESS || !still) {
                               if (onDone == null && attempt < 3) main.postDelayed({ capture(t, attempt + 1) }, 1000)
                           } else if (blankBmp(bmp)) {
@@ -6566,6 +6431,17 @@ jobs:
                           )
                   ) {
                       Box(Modifier.fillMaxSize()) {
+                          Box(
+                              Modifier.fillMaxSize().graphicsLayer {
+                                  val v = Motion.browserIn.value
+                                  if (v < 1f) {
+                                      val s = 0.92f + 0.08f * v
+                                      scaleX = s
+                                      scaleY = s
+                                      alpha = v
+                                  }
+                              }
+                          ) {
                           BrowserScreen(
                               tabs,
                               active = screen == "browser",
@@ -6580,6 +6456,7 @@ jobs:
                               onDownloads = { screen = "downloads" },
                               onLogs = { screen = "logs" }
                           )
+                          }
                           StartupWarmup(tabs)
                           OverlayHost(screen, tabs) { name ->
                           when (name) {
@@ -6587,16 +6464,16 @@ jobs:
                                           tabs,
                                           onBack = { screen = "browser" },
                                           onNewTab = {
-              Motion.exit = ExitMode.NewTab
+              Motion.exit = ExitMode.Fade
               tabs.home = true
               screen = "browser"
               scope.launch {
-                  delay(300)
+                  delay(330)
                   startEdit = true
               }
           },
                                           onSelect = { t ->
-              Motion.exit = ExitMode.Card(t.id)
+              Motion.exit = ExitMode.Fade
               tabs.select(t)
               tabs.home = false
               screen = "browser"
@@ -6955,7 +6832,6 @@ jobs:
                                   .size(44.dp)
                                   .clip(RoundedCornerShape(10.dp))
                                   .background(Field)
-                                  .onGloballyPositioned { Motion.tabsBtn = it.boundsInWindow() }
                                   .clickable {
                                       val cc = cur
                                       if (cc != null) tabs.capture(cc, 0) { onTabs() } else onTabs()
@@ -7808,7 +7684,6 @@ jobs:
                   Box(
                       Modifier
                           .size(84.dp)
-                          .onGloballyPositioned { Motion.cardRects[t.id] = it.boundsInWindow() }
                           .clip(RoundedCornerShape(8.dp))
                           .background(Field),
                       contentAlignment = Alignment.Center
@@ -7867,7 +7742,6 @@ jobs:
                               .size(38.dp)
                               .clip(CircleShape)
                               .background(Color.White)
-                              .onGloballyPositioned { Motion.newBtn = it.boundsInWindow() }
                               .clickable { onNewTab() },
                           contentAlignment = Alignment.Center
                       ) {
