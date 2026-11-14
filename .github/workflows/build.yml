@@ -1739,6 +1739,9 @@ jobs:
               // 1 = browser fully shown; below 1 it is faded and slightly small (used when opening a tab / new tab)
               val browserIn = Animatable(1f)
               var exit: ExitMode = ExitMode.Back
+
+              // bumped whenever the script list is saved so open screens reload it
+              var storeVersion by mutableStateOf(0)
           }
 
           private val Decel = CubicBezierEasing(0.05f, 0.7f, 0.1f, 1f)
@@ -2039,6 +2042,7 @@ jobs:
                       arr.put(o)
                   }
                   sp().edit().putString("list", arr.toString()).apply()
+                  Motion.storeVersion = Motion.storeVersion + 1
               }
 
               @Synchronized
@@ -8087,7 +8091,7 @@ jobs:
           @Composable
           fun ScriptsScreen(onBack: () -> Unit, onEdit: (String?) -> Unit, onGuide: () -> Unit) {
               val scope = rememberCoroutineScope()
-              var scripts by remember { mutableStateOf(Store.load()) }
+              var scripts by remember(Motion.storeVersion) { mutableStateOf(Store.load()) }
               var status by remember { mutableStateOf("") }
               var busy by remember { mutableStateOf(false) }
               var showImport by remember { mutableStateOf(false) }
