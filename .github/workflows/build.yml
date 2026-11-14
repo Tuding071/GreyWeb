@@ -6435,9 +6435,6 @@ jobs:
                               Modifier.fillMaxSize().graphicsLayer {
                                   val v = Motion.browserIn.value
                                   if (v < 1f) {
-                                      val s = 0.92f + 0.08f * v
-                                      scaleX = s
-                                      scaleY = s
                                       alpha = v
                                   }
                               }
