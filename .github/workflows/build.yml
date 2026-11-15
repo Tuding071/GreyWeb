@@ -1942,17 +1942,17 @@ jobs:
                   grabOnly = sp().getBoolean("grabonly", false)
               }
 
-              fun setConfirm(v: Boolean) {
+              fun saveConfirm(v: Boolean) {
                   confirm = v
                   sp().edit().putBoolean("dlconfirm", v).apply()
               }
 
-              fun setAutoPreview(v: Boolean) {
+              fun saveAutoPreview(v: Boolean) {
                   autoPreview = v
                   sp().edit().putBoolean("dlpreview", v).apply()
               }
 
-              fun setGrabOnly(v: Boolean) {
+              fun saveGrabOnly(v: Boolean) {
                   grabOnly = v
                   sp().edit().putBoolean("grabonly", v).apply()
               }
@@ -3676,7 +3676,7 @@ jobs:
           fun confirmAsk(a: DlAsk, dontAsk: Boolean) {
               a.cancelled = true
               val item = a.finalItem()
-              if (dontAsk) DlPrefs.setConfirm(false)
+              if (dontAsk) DlPrefs.saveConfirm(false)
               ask = null
               add(item)
               nextAsk()
@@ -7718,11 +7718,11 @@ jobs:
                                           trailingIcon = {
                                               Switch(
                                                   checked = DlPrefs.grabOnly,
-                                                  onCheckedChange = { v -> DlPrefs.setGrabOnly(v) },
+                                                  onCheckedChange = { v -> DlPrefs.saveGrabOnly(v) },
                                                   colors = switchColors()
                                               )
                                           },
-                                          onClick = { DlPrefs.setGrabOnly(!DlPrefs.grabOnly) }
+                                          onClick = { DlPrefs.saveGrabOnly(!DlPrefs.grabOnly) }
                                       )
                                   }
 
@@ -10324,11 +10324,11 @@ jobs:
                               )
                               DropdownMenuItem(
                                   text = { Text(if (DlPrefs.confirm) "Ask before download: On" else "Ask before download: Off", color = Color.White) },
-                                  onClick = { DlPrefs.setConfirm(!DlPrefs.confirm) }
+                                  onClick = { DlPrefs.saveConfirm(!DlPrefs.confirm) }
                               )
                               DropdownMenuItem(
                                   text = { Text(if (DlPrefs.autoPreview) "Auto preview: On" else "Auto preview: Off", color = Color.White) },
-                                  onClick = { DlPrefs.setAutoPreview(!DlPrefs.autoPreview) }
+                                  onClick = { DlPrefs.saveAutoPreview(!DlPrefs.autoPreview) }
                               )
                               DropdownMenuItem(
                                   text = { Text("Change folder", color = Color.White) },
