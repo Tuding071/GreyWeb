@@ -1365,6 +1365,11 @@ jobs:
                   val ck = try { CookieManager.getInstance().getCookie(url) } catch (e: Exception) { null }
                   if (!ck.isNullOrBlank()) h["Cookie"] = ck
                   if (!h.containsKey("User-Agent")) h["User-Agent"] = ua
+                  if (!h.containsKey("Referer") && t.pageUrl.startsWith("http")) h["Referer"] = t.pageUrl
+                  if (!h.containsKey("Origin")) {
+                      val og = originOfUrl(h["Referer"] ?: "")
+                      if (og != null) h["Origin"] = og
+                  }
                   if (isManifest) {
                       try {
                           val dir = url.substringBefore('?').substringBeforeLast('/') + "/"
@@ -1884,29 +1889,31 @@ jobs:
           cat > app/src/main/java/com/grey/web/DlDialog.kt <<'EOF'
           package com.grey.web
 
+          import androidx.compose.animation.core.Animatable
+          import androidx.compose.animation.core.tween
           import androidx.compose.foundation.Image
           import androidx.compose.foundation.background
-          import androidx.compose.foundation.border
           import androidx.compose.foundation.clickable
           import androidx.compose.foundation.layout.Arrangement
           import androidx.compose.foundation.layout.Box
           import androidx.compose.foundation.layout.Column
-          import androidx.compose.foundation.layout.PaddingValues
           import androidx.compose.foundation.layout.Row
           import androidx.compose.foundation.layout.Spacer
           import androidx.compose.foundation.layout.aspectRatio
           import androidx.compose.foundation.layout.fillMaxSize
           import androidx.compose.foundation.layout.fillMaxWidth
           import androidx.compose.foundation.layout.height
+          import androidx.compose.foundation.layout.heightIn
           import androidx.compose.foundation.layout.padding
-          import androidx.compose.foundation.layout.width
+          import androidx.compose.foundation.layout.size
           import androidx.compose.foundation.rememberScrollState
+          import androidx.compose.foundation.shape.CircleShape
           import androidx.compose.foundation.shape.RoundedCornerShape
           import androidx.compose.foundation.text.BasicTextField
           import androidx.compose.foundation.verticalScroll
           import androidx.compose.material3.AlertDialog
-          import androidx.compose.material3.Checkbox
-          import androidx.compose.material3.CheckboxDefaults
+          import androidx.compose.material3.RadioButton
+          import androidx.compose.material3.RadioButtonDefaults
           import androidx.compose.material3.Text
           import androidx.compose.material3.TextButton
           import androidx.compose.runtime.Composable
@@ -1923,11 +1930,14 @@ jobs:
           import androidx.compose.ui.graphics.Color
           import androidx.compose.ui.graphics.ImageBitmap
           import androidx.compose.ui.graphics.SolidColor
+          import androidx.compose.ui.graphics.graphicsLayer
           import androidx.compose.ui.layout.ContentScale
+          import androidx.compose.ui.platform.LocalContext
           import androidx.compose.ui.text.TextStyle
           import androidx.compose.ui.text.style.TextOverflow
           import androidx.compose.ui.unit.dp
           import androidx.compose.ui.unit.sp
+          import kotlinx.coroutines.delay
 
           object DlPrefs {
               var confirm by mutableStateOf(true)
@@ -1958,6 +1968,24 @@ jobs:
               }
           }
 
+          // Turns "page title" values that are really links (or empty) into something readable.
+          fun niceTitle(t0: String, url: String): String {
+              val t = t0.trim()
+              val looksUrl = t.isEmpty() || t.startsWith("http", true) || t.startsWith("www.", true) ||
+                  t.contains("://") || (!t.contains(' ') && t.contains('.') && t.contains('/'))
+              if (!looksUrl) return t
+              val seg = url.substringBefore('?').substringBefore('#').trimEnd('/').substringAfterLast('/').substringBeforeLast('.')
+              val generic = setOf(
+                  "index", "master", "playlist", "chunklist", "manifest", "video", "stream", "main", "hls", "dash",
+                  "media", "default", "prog_index", "stream_0", "mpd"
+              )
+              val hashLike = Regex("^[0-9a-fA-F_-]{16,}$").matches(seg)
+              if (seg.length in 3..60 && seg.lowercase() !in generic && !hashLike) return seg
+              val stamp = java.text.SimpleDateFormat("yyyyMMdd-HHmm", java.util.Locale.US).format(java.util.Date())
+              val host = hostOf(url).removePrefix("www.")
+              return (if (host.isBlank()) "video" else host) + "-" + stamp
+          }
+
           class DlInfo(
               val url: String,
               val mime: String,
@@ -1969,7 +1997,9 @@ jobs:
 
           @Stable
           class DlAsk(val item: DlItem, val info: DlInfo) {
-              var name by mutableStateOf(item.name)
+              val options: List<VideoItem> =
+                  if (info.all.isNotEmpty()) info.all else if (info.video != null) listOf(info.video) else emptyList()
+              var name by mutableStateOf(initialName())
               var size by mutableStateOf(info.size)
               var mime by mutableStateOf(info.mime)
               var duration by mutableStateOf(0.0)
@@ -1978,12 +2008,14 @@ jobs:
               var inspected by mutableStateOf(false)
               var pState by mutableStateOf(0)
               var pNote by mutableStateOf("")
-              var sel by mutableStateOf(0)
+              var sel by mutableStateOf(options.indexOfFirst { it === info.video }.coerceAtLeast(0))
               val frames = mutableStateListOf<ImageBitmap?>(null, null, null, null, null)
-              val options: List<VideoItem>
 
               @Volatile
               var cancelled = false
+
+              @Volatile
+              var gen = 0
 
               @Volatile
               var plan: SegPlan? = null
@@ -1997,49 +2029,163 @@ jobs:
               @Volatile
               var rangeOk = false
 
-              init {
-                  val v = info.video
-                  var opts: List<VideoItem> = emptyList()
-                  if (v != null && !v.label.startsWith("Audio") && v.kind != "AUDIO") {
-                      if (v.kind == "HLS" || v.kind == "DASH") {
-                          opts = info.all.filter { it.kind == v.kind && !it.label.startsWith("Audio") }
-                          if (opts.none { it === v }) opts = listOf(v)
-                      }
-                  }
-                  options = opts
-                  sel = opts.indexOfFirst { it === v }.coerceAtLeast(0)
+              private fun initialName(): String {
+                  val n = item.name
+                  return if (options.isNotEmpty() && item.kind == "file") n.substringBeforeLast('.', n) else n
               }
+
+              val current: VideoItem?
+                  get() = if (options.isEmpty()) info.video else options.getOrNull(sel)
+
+              val curUrl: String
+                  get() = current?.url ?: info.url
+
+              val curHeaders: Map<String, String>
+                  get() = current?.headers ?: item.headers
 
               fun bwOf(o: VideoItem): Long = (o.rank % 100000L) * 1000L
 
               fun estimate(i: Int): Long {
-                  if (duration <= 0.0 || i < 0 || i >= options.size) return -1L
-                  val bw = bwOf(options[i])
-                  if (bw <= 0L) return -1L
-                  return (bw / 8.0 * duration).toLong()
+                  if (i < 0 || i >= options.size) return -1L
+                  val o = options[i]
+                  if (o.kind == "HLS" || o.kind == "DASH") {
+                      if (duration <= 0.0) return -1L
+                      val bw = bwOf(o)
+                      return if (bw > 0L) (bw / 8.0 * duration).toLong() else -1L
+                  }
+                  return if (o.rank > 0L) o.rank else -1L
+              }
+
+              fun select(i: Int) {
+                  if (i == sel || i !in options.indices) return
+                  sel = i
+                  gen++
+                  for (k in 0 until frames.size) frames[k] = null
+                  pState = 0
+                  pNote = ""
+                  canPreview = false
+                  inspected = false
+                  live = false
+                  plan = null
+                  directUrl = ""
+                  rangeOk = false
+                  FramePreview.inspect(this)
               }
 
               fun finalItem(): DlItem {
-                  val chosen = if (options.isNotEmpty() && sel in options.indices) options[sel] else null
-                  val out = if (chosen != null && chosen !== info.video) {
+                  val chosen = current
+                  val out = if (options.isNotEmpty() && chosen != null) {
                       Downloads.buildVideo(chosen, info.title, info.all)
                   } else {
                       item
                   }
                   val n = name.trim()
-                  if (n.isNotEmpty()) out.name = Downloads.clean(n)
+                  if (n.isNotEmpty()) {
+                      if (options.isNotEmpty() && out.kind == "file") {
+                          val oe = out.name.substringAfterLast('.', "")
+                          val suffix = if (oe.isNotEmpty() && oe.length <= 5) "." + oe else ""
+                          out.name = Downloads.clean(n) + suffix
+                      } else {
+                          out.name = Downloads.clean(n)
+                      }
+                  }
                   return out
+              }
+          }
+
+          @Composable
+          private fun PreviewSlides(a: DlAsk) {
+              val have = ArrayList<ImageBitmap>()
+              for (i in 0 until a.frames.size) {
+                  val f = a.frames[i]
+                  if (f != null) have.add(f)
+              }
+              var idx by remember(a) { mutableStateOf(0) }
+              LaunchedEffect(have.size) {
+                  while (have.size > 1) {
+                      delay(1500)
+                      idx = (idx + 1) % have.size
+                  }
+              }
+              Box(
+                  Modifier
+                      .fillMaxWidth()
+                      .aspectRatio(16f / 9f)
+                      .clip(RoundedCornerShape(10.dp))
+                      .background(Field)
+                      .clickable { if (have.size > 1) idx = (idx + 1) % have.size },
+                  contentAlignment = Alignment.Center
+              ) {
+                  if (have.isNotEmpty()) {
+                      val shown = have[idx.coerceIn(0, have.size - 1)]
+                      val al = remember(shown) { Animatable(0f) }
+                      val last = remember(a) { mutableStateOf<ImageBitmap?>(null) }
+                      LaunchedEffect(shown) {
+                          al.animateTo(1f, tween(260))
+                          last.value = shown
+                      }
+                      val lb = last.value
+                      if (lb != null && lb !== shown) {
+                          Image(
+                              bitmap = lb,
+                              contentDescription = null,
+                              contentScale = ContentScale.Crop,
+                              modifier = Modifier.fillMaxSize()
+                          )
+                      }
+                      Image(
+                          bitmap = shown,
+                          contentDescription = null,
+                          contentScale = ContentScale.Crop,
+                          modifier = Modifier.fillMaxSize().graphicsLayer { alpha = al.value }
+                      )
+                      if (have.size > 1) {
+                          Row(
+                              Modifier.align(Alignment.BottomCenter).padding(bottom = 6.dp),
+                              horizontalArrangement = Arrangement.spacedBy(5.dp)
+                          ) {
+                              for (k in have.indices) {
+                                  Box(
+                                      Modifier
+                                          .size(6.dp)
+                                          .clip(CircleShape)
+                                          .background(if (k == idx.coerceIn(0, have.size - 1)) Color.White else Color(0x88FFFFFF))
+                                  )
+                              }
+                          }
+                      }
+                  } else if (a.pState == 1) {
+                      Text("Loading frames…", color = Soft, fontSize = 13.sp)
+                  } else if (a.pState == 0) {
+                      TextButton(onClick = { FramePreview.load(a) }) {
+                          Text("Load preview (~1 MB)", color = Color.White, fontSize = 14.sp)
+                      }
+                  } else {
+                      Column(horizontalAlignment = Alignment.CenterHorizontally, modifier = Modifier.padding(12.dp)) {
+                          Text(
+                              a.pNote.ifBlank { "Preview not available" },
+                              color = Soft,
+                              fontSize = 12.sp,
+                              maxLines = 3,
+                              overflow = TextOverflow.Ellipsis
+                          )
+                          TextButton(onClick = { FramePreview.retry(a) }) {
+                              Text("Retry", color = Color.White, fontSize = 13.sp)
+                          }
+                      }
+                  }
               }
           }
 
           @Composable
           fun DownloadConfirm() {
               val a = Downloads.ask ?: return
-              var dontAsk by remember(a) { mutableStateOf(false) }
-              LaunchedEffect(a.inspected, a.canPreview) {
+              val ctx = LocalContext.current
+              LaunchedEffect(a.inspected, a.canPreview, a.gen) {
                   if (DlPrefs.autoPreview && a.inspected && a.canPreview && a.pState == 0) FramePreview.load(a)
               }
-              val isVideo = a.info.video != null
+              val cur = a.current
+              val isVideo = cur != null
               AlertDialog(
                   onDismissRequest = { Downloads.cancelConfirm(a) },
                   containerColor = Bar,
@@ -2047,11 +2193,10 @@ jobs:
                   text = {
                       Column(Modifier.verticalScroll(rememberScrollState())) {
                           val parts = ArrayList<String>()
-                          val host = hostOf(a.info.url)
+                          val host = hostOf(a.curUrl)
                           if (host.isNotBlank()) parts.add(host)
-                          val v = a.info.video
-                          if (v != null) {
-                              parts.add(v.kind)
+                          if (cur != null) {
+                              parts.add(cur.kind)
                           } else if (a.mime.isNotBlank()) {
                               parts.add(a.mime.substringBefore(';'))
                           }
@@ -2062,7 +2207,7 @@ jobs:
                               if (e > 0L) parts.add("~" + fmtSize(e))
                           } else if (a.size > 0L) {
                               parts.add(fmtSize(a.size))
-                          } else if (v == null || (v.kind != "HLS" && v.kind != "DASH")) {
+                          } else {
                               parts.add("size unknown")
                           }
                           Text(parts.joinToString(" · "), color = Soft, fontSize = 12.sp)
@@ -2085,99 +2230,61 @@ jobs:
                           )
                           if (a.options.size > 1) {
                               Spacer(Modifier.height(10.dp))
-                              Text("Quality", color = Soft, fontSize = 12.sp)
-                              for ((i, o) in a.options.withIndex()) {
-                                  val on = i == a.sel
-                                  val shape = RoundedCornerShape(8.dp)
-                                  Row(
-                                      Modifier
-                                          .fillMaxWidth()
-                                          .padding(top = 4.dp)
-                                          .clip(shape)
-                                          .background(if (on) Field else Color.Transparent)
-                                          .border(0.5.dp, if (on) Color.White else Color(0xFF444444), shape)
-                                          .clickable { a.sel = i }
-                                          .padding(horizontal = 10.dp, vertical = 8.dp),
-                                      verticalAlignment = Alignment.CenterVertically
-                                  ) {
-                                      Text(o.label, color = Color.White, fontSize = 14.sp, modifier = Modifier.width(58.dp))
-                                      Text(
-                                          o.sub.removePrefix(o.kind + " · "),
-                                          color = Soft,
-                                          fontSize = 11.sp,
-                                          maxLines = 1,
-                                          overflow = TextOverflow.Ellipsis,
-                                          modifier = Modifier.weight(1f)
-                                      )
-                                      val est = a.estimate(i)
-                                      if (est > 0L) Text("~" + fmtSize(est), color = Color.White, fontSize = 12.sp)
+                              Text("Choose what to download", color = Soft, fontSize = 12.sp)
+                              Column(
+                                  Modifier
+                                      .fillMaxWidth()
+                                      .heightIn(max = 230.dp)
+                                      .verticalScroll(rememberScrollState())
+                              ) {
+                                  for ((i, o) in a.options.withIndex()) {
+                                      val on = i == a.sel
+                                      Row(
+                                          Modifier
+                                              .fillMaxWidth()
+                                              .clickable { a.select(i) }
+                                              .padding(vertical = 2.dp),
+                                          verticalAlignment = Alignment.CenterVertically
+                                      ) {
+                                          RadioButton(
+                                              selected = on,
+                                              onClick = { a.select(i) },
+                                              colors = RadioButtonDefaults.colors(selectedColor = Color.White, unselectedColor = Soft)
+                                          )
+                                          Column(Modifier.weight(1f)) {
+                                              Text(o.label, color = Color.White, fontSize = 14.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                                              Text(o.sub, color = Soft, fontSize = 11.sp, maxLines = 2, overflow = TextOverflow.Ellipsis)
+                                          }
+                                          val est = a.estimate(i)
+                                          if (est > 0L) {
+                                              Text("~" + fmtSize(est), color = Color.White, fontSize = 12.sp, modifier = Modifier.padding(start = 6.dp))
+                                          }
+                                      }
                                   }
                               }
                           }
                           if (a.canPreview || a.pState != 0) {
                               Spacer(Modifier.height(10.dp))
-                              Text("Preview", color = Soft, fontSize = 12.sp)
-                              Spacer(Modifier.height(4.dp))
-                              Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(4.dp)) {
-                                  for (i in 0 until 5) {
-                                      val fr = a.frames[i]
-                                      Box(
-                                          Modifier
-                                              .weight(1f)
-                                              .aspectRatio(1.6f)
-                                              .clip(RoundedCornerShape(6.dp))
-                                              .background(Field)
-                                      ) {
-                                          if (fr != null) {
-                                              Image(
-                                                  bitmap = fr,
-                                                  contentDescription = null,
-                                                  contentScale = ContentScale.Crop,
-                                                  modifier = Modifier.fillMaxSize()
-                                              )
-                                          }
-                                      }
-                                  }
-                              }
-                              if (a.pState == 0) {
-                                  TextButton(
-                                      onClick = { FramePreview.load(a) },
-                                      contentPadding = PaddingValues(horizontal = 4.dp)
-                                  ) { Text("Load preview (~1 MB)", color = Color.White, fontSize = 13.sp) }
-                              } else if (a.pState == 1) {
-                                  Text("Loading frames…", color = Soft, fontSize = 12.sp, modifier = Modifier.padding(top = 4.dp))
-                              } else if (a.pState == 3) {
-                                  Text(
-                                      a.pNote.ifBlank { "Preview not available" },
-                                      color = Soft,
-                                      fontSize = 12.sp,
-                                      modifier = Modifier.padding(top = 4.dp)
-                                  )
-                              }
+                              PreviewSlides(a)
                           } else if (a.pNote.isNotBlank()) {
                               Spacer(Modifier.height(8.dp))
                               Text(a.pNote, color = Soft, fontSize = 12.sp)
                           }
-                          Spacer(Modifier.height(8.dp))
-                          Row(
-                              Modifier.fillMaxWidth().clickable { dontAsk = !dontAsk },
-                              verticalAlignment = Alignment.CenterVertically
-                          ) {
-                              Checkbox(
-                                  checked = dontAsk,
-                                  onCheckedChange = { dontAsk = it },
-                                  colors = CheckboxDefaults.colors(
-                                      checkedColor = Color.White,
-                                      checkmarkColor = BG,
-                                      uncheckedColor = Soft
-                                  )
-                              )
-                              Text("Don't ask again", color = Soft, fontSize = 13.sp)
+                          if (cur != null) {
+                              Row(Modifier.fillMaxWidth().padding(top = 4.dp)) {
+                                  TextButton(onClick = {
+                                      copyText(ctx, cur.url)
+                                      toast(ctx, "Link copied")
+                                  }) { Text("Copy link", color = Soft, fontSize = 13.sp) }
+                                  TextButton(onClick = { toast(ctx, Handoff.send(ctx, cur)) }) {
+                                      Text("Send", color = Soft, fontSize = 13.sp)
+                                  }
+                              }
                           }
                       }
                   },
                   confirmButton = {
-                      TextButton(onClick = { Downloads.confirmAsk(a, dontAsk) }) { Text("Download", color = Color.White) }
+                      TextButton(onClick = { Downloads.confirmAsk(a) }) { Text("Download", color = Color.White) }
                   },
                   dismissButton = {
                       TextButton(onClick = { Downloads.cancelConfirm(a) }) { Text("Cancel", color = Color.White) }
@@ -2201,12 +2308,14 @@ jobs:
           import java.util.concurrent.Executors
           import java.util.concurrent.TimeUnit
           import java.util.concurrent.atomic.AtomicInteger
+          import java.util.concurrent.atomic.AtomicReference
           import javax.crypto.Cipher
           import javax.crypto.spec.IvParameterSpec
           import javax.crypto.spec.SecretKeySpec
 
           object FramePreview {
               private const val PART = 400 * 1024
+              private const val BIG = 1500 * 1024
               private val FRACTIONS = doubleArrayOf(0.10, 0.30, 0.50, 0.70, 0.90)
               private val pool = Executors.newFixedThreadPool(3) { r ->
                   val t = Thread(r)
@@ -2220,10 +2329,20 @@ jobs:
                   c.readTimeout = 15000
                   c.instanceFollowRedirects = true
                   c.setRequestProperty("User-Agent", h["User-Agent"] ?: DEFAULT_UA)
-                  for (k in listOf("Referer", "Cookie", "Origin")) {
-                      val v = h[k]
-                      if (!v.isNullOrBlank()) c.setRequestProperty(k, v)
+                  val ref = h["Referer"]
+                  if (!ref.isNullOrBlank()) c.setRequestProperty("Referer", ref)
+                  var origin = h["Origin"]
+                  if (origin.isNullOrBlank() && !ref.isNullOrBlank()) origin = originOfUrl(ref)
+                  if (!origin.isNullOrBlank()) c.setRequestProperty("Origin", origin)
+                  var ck = h["Cookie"]
+                  if (ck.isNullOrBlank()) {
+                      ck = try {
+                          android.webkit.CookieManager.getInstance().getCookie(url)
+                      } catch (e: Exception) {
+                          null
+                      }
                   }
+                  if (!ck.isNullOrBlank()) c.setRequestProperty("Cookie", ck)
                   if (range != null) c.setRequestProperty("Range", range)
                   return c
               }
@@ -2272,39 +2391,43 @@ jobs:
                   return d * 86400.0 + h * 3600.0 + mi * 60.0 + sec
               }
 
+              private fun post(a: DlAsk, g: Int, f: () -> Unit) {
+                  Web.postMain { if (a.gen == g && !a.cancelled) f() }
+              }
+
+              private fun note(a: DlAsk, g: Int, s: String) {
+                  post(a, g) { a.pNote = s }
+              }
+
               // ---------------- inspect (small playlist/header requests only) ----------------
 
               fun inspect(a: DlAsk) {
+                  val g = a.gen
                   Thread {
                       try {
-                          val v = a.info.video
-                          if (v != null && v.kind == "HLS") {
-                              inspectHls(a, v)
+                          val v = a.current
+                          if (v != null && (v.kind == "AUDIO" || v.label.startsWith("Audio"))) {
+                              note(a, g, "Audio only: no preview")
+                          } else if (v != null && v.kind == "HLS") {
+                              inspectHls(a, g, v)
                           } else if (v != null && v.kind == "DASH") {
-                              inspectDash(a, v)
+                              inspectDash(a, g, v)
                           } else {
-                              inspectFile(a)
+                              inspectFile(a, g)
                           }
                       } catch (e: Exception) {
                           Log.d("GreyScript", "inspect failed: " + e)
-                          Web.postMain { if (a.pNote.isEmpty()) a.pNote = "Preview not available" }
+                          post(a, g) { if (a.pNote.isEmpty()) a.pNote = "Preview not available" }
                       }
-                      Web.postMain { a.inspected = true }
+                      post(a, g) { a.inspected = true }
                   }.start()
               }
 
-              private fun note(a: DlAsk, s: String) {
-                  Web.postMain { a.pNote = s }
-              }
-
-              private fun inspectHls(a: DlAsk, v: VideoItem) {
-                  if (v.label.startsWith("Audio")) {
-                      note(a, "Audio track: no preview")
-                      return
-                  }
+              private fun inspectHls(a: DlAsk, g: Int, v: VideoItem) {
                   var low: VideoItem = v
                   var lowRank = Long.MAX_VALUE
                   for (o in a.options) {
+                      if (o.kind != "HLS" || o.label.startsWith("Audio")) continue
                       if (o.rank >= 0L && o.rank < lowRank) {
                           lowRank = o.rank
                           low = o
@@ -2362,19 +2485,15 @@ jobs:
                   a.planHeaders = low.headers
                   val d2 = dur
                   val live = !ended
-                  Web.postMain {
-                      a.duration = d2
+                  post(a, g) {
+                      if (d2 > 0.0) a.duration = d2
                       a.live = live
                       a.canPreview = ok
                       a.pNote = msg
                   }
               }
 
-              private fun inspectDash(a: DlAsk, v: VideoItem) {
-                  if (v.label.startsWith("Audio")) {
-                      note(a, "Audio track: no preview")
-                      return
-                  }
+              private fun inspectDash(a: DlAsk, g: Int, v: VideoItem) {
                   val xml = fetchText(v.url, v.headers)
                   val reps = parseMpd(v.url, xml)
                   var low: DashRep? = null
@@ -2386,11 +2505,11 @@ jobs:
                   val ds = Regex("mediaPresentationDuration=\"([^\"]+)\"").find(xml)?.groupValues?.get(1)
                   val dur = if (ds != null) isoDur(ds) else 0.0
                   if (low == null) {
-                      note(a, "Preview not available")
+                      note(a, g, "Preview not available")
                       return
                   }
                   val single = low.single
-                  var ok: Boolean
+                  val ok: Boolean
                   if (single != null) {
                       a.directUrl = single
                       a.planHeaders = v.headers
@@ -2402,11 +2521,10 @@ jobs:
                       a.planHeaders = v.headers
                       ok = p != null && p.segs.isNotEmpty()
                   }
-                  val okF = ok
-                  Web.postMain {
-                      a.duration = dur
-                      a.canPreview = okF
-                      if (!okF) a.pNote = "Preview not available"
+                  post(a, g) {
+                      if (dur > 0.0) a.duration = dur
+                      a.canPreview = ok
+                      if (!ok) a.pNote = "Preview not available"
                   }
               }
 
@@ -2419,9 +2537,9 @@ jobs:
                   }
               }
 
-              private fun inspectFile(a: DlAsk) {
-                  val url = a.info.url
-                  val h = a.item.headers
+              private fun inspectFile(a: DlAsk, g: Int) {
+                  val url = a.curUrl
+                  val h = a.curHeaders
                   val c = open(url, h, "bytes=0-0")
                   try {
                       val code = c.responseCode
@@ -2436,7 +2554,7 @@ jobs:
                           total = c.contentLengthLong
                       }
                       val range = code == 206
-                      val suggested = if (a.item.name.isBlank()) Downloads.suggestName(cd, c.url.toString(), ct) else ""
+                      val suggested = if (a.item.name.isBlank() && a.options.isEmpty()) Downloads.suggestName(cd, c.url.toString(), ct) else ""
                       val path = url.substringBefore('?').substringBefore('#').lowercase()
                       val vidExt = path.endsWith(".mp4") || path.endsWith(".m4v") || path.endsWith(".webm") ||
                           path.endsWith(".mkv") || path.endsWith(".mov") || path.endsWith(".3gp") || path.endsWith(".avi") ||
@@ -2445,8 +2563,8 @@ jobs:
                       a.rangeOk = range
                       a.directUrl = url
                       a.planHeaders = h
-                      Web.postMain {
-                          if (total > 0L && a.size <= 0L) a.size = total
+                      post(a, g) {
+                          if (total > 0L && a.size <= 0L && a.options.isEmpty()) a.size = total
                           if (ct.isNotBlank()) a.mime = ct.substringBefore(';')
                           if (suggested.isNotBlank() && a.name.isBlank()) a.name = suggested
                           a.canPreview = isVid && range
@@ -2459,44 +2577,53 @@ jobs:
 
               // ---------------- frames (only when asked) ----------------
 
+              fun retry(a: DlAsk) {
+                  for (k in 0 until a.frames.size) a.frames[k] = null
+                  a.pState = 0
+                  a.pNote = ""
+                  load(a)
+              }
+
               fun load(a: DlAsk) {
                   if (a.pState == 1 || !a.canPreview) return
+                  val g = a.gen
                   a.pState = 1
                   a.pNote = ""
+                  val err = AtomicReference<String>("")
                   Thread {
                       var got = 0
                       try {
                           val p = a.plan
                           if (p != null) {
-                              got = framesFromPlan(a, p)
+                              got = framesFromPlan(a, g, p, err)
                           } else if (a.directUrl.isNotBlank()) {
-                              got = framesFromFile(a)
+                              got = framesFromFile(a, g)
                           }
                       } catch (e: Exception) {
                           Log.d("GreyScript", "preview failed: " + e)
+                          err.set(e.message ?: "")
                       }
                       val n = got
-                      Web.postMain {
-                          if (!a.cancelled) {
-                              a.pState = if (n > 0) 2 else 3
-                              if (n == 0) a.pNote = "Could not read preview frames"
-                          }
+                      val er = err.get()
+                      post(a, g) {
+                          a.pState = if (n > 0) 2 else 3
+                          if (n == 0) a.pNote = if (er.isNotBlank()) "Could not read frames (" + er + ")" else "Could not read frames"
                       }
                   }.start()
               }
 
               private fun scaleFrame(src: Bitmap): Bitmap {
-                  val w = 192
+                  val w = 480
                   val h = (src.height * w / src.width.coerceAtLeast(1)).coerceAtLeast(1)
                   val s = Bitmap.createScaledBitmap(src, w, h, true)
                   if (s !== src) src.recycle()
                   return s
               }
 
-              private fun deliver(a: DlAsk, slot: Int, bmp: Bitmap) {
+              private fun deliver(a: DlAsk, g: Int, slot: Int, bmp: Bitmap) {
                   val ib = bmp.asImageBitmap()
-                  Web.postMain {
-                      if (!a.cancelled && slot in 0 until a.frames.size) a.frames[slot] = ib
+                  post(a, g) {
+                      if (slot in 0 until a.frames.size) a.frames[slot] = ib
                   }
               }
 
@@ -2518,7 +2645,50 @@ jobs:
                   }
               }
 
-              private fun framesFromPlan(a: DlAsk, plan: SegPlan): Int {
+              private fun trimTs(b: ByteArray): ByteArray {
+                  if (b.size > 188 && b[0] == 0x47.toByte()) {
+                      val n = b.size - b.size % 188
+                      if (n < b.size) return b.copyOf(n)
+                  }
+                  return b
+              }
+
+              private fun segFrame(
+                  a: DlAsk, plan: SegPlan, h: Map<String, String>, tmp: File, slot: Int, si: Int,
+                  initF: ByteArray?, keys: HashMap<String, ByteArray>, err: AtomicReference<String>
+              ): Bitmap? {
+                  val seg = plan.segs[si]
+                  for (limit in intArrayOf(PART, BIG)) {
+                      var b = readPart(seg.url, h, limit)
+                      val whole = b.size < limit
+                      val ku = seg.keyUrl
+                      if (ku != null) {
+                          val key = synchronized(keys) { keys.getOrPut(ku) { readPart(ku, h, 64) } }
+                          val iv = seg.iv ?: ivFromSeq(seg.seq)
+                          val len = b.size - b.size % 16
+                          val cipher = Cipher.getInstance("AES/CBC/NoPadding")
+                          cipher.init(Cipher.DECRYPT_MODE, SecretKeySpec(key, "AES"), IvParameterSpec(iv))
+                          b = cipher.doFinal(b, 0, len)
+                      }
+                      if (initF == null) b = trimTs(b)
+                      val f = File(tmp, a.item.id + "_" + slot + "_" + si + "." + (if (initF != null) "mp4" else plan.ext))
+                      try {
+                          f.outputStream().use { o ->
+                              if (initF != null) o.write(initF)
+                              o.write(b)
+                          }
+                          val bmp = grabFromPath(f.absolutePath)
+                          if (bmp != null) return bmp
+                      } finally {
+                          f.delete()
+                      }
+                      if (whole) break
+                  }
+                  err.set("no picture in segment")
+                  return null
+              }
+
+              private fun framesFromPlan(a: DlAsk, g: Int, plan: SegPlan, err: AtomicReference<String>): Int {
                   val n = plan.segs.size
                   if (n == 0) return 0
                   val idxs = ArrayList<Int>()
@@ -2536,6 +2706,7 @@ jobs:
                       initBytes = try {
                           readPart(ini, h, 4000000)
                       } catch (e: Exception) {
+                          err.set(e.message ?: "init")
                           null
                       }
                   }
@@ -2546,60 +2717,50 @@ jobs:
                   for ((slot, si) in idxs.withIndex()) {
                       pool.execute {
                           try {
-                              if (a.cancelled) return@execute
-                              val seg = plan.segs[si]
-                              var b = readPart(seg.url, h, PART)
-                              val ku = seg.keyUrl
-                              if (ku != null) {
-                                  val key = synchronized(keys) { keys.getOrPut(ku) { readPart(ku, h, 64) } }
-                                  val iv = seg.iv ?: ivFromSeq(seg.seq)
-                                  val len = b.size - b.size % 16
-                                  val cipher = Cipher.getInstance("AES/CBC/NoPadding")
-                                  cipher.init(Cipher.DECRYPT_MODE, SecretKeySpec(key, "AES"), IvParameterSpec(iv))
-                                  b = cipher.doFinal(b, 0, len)
-                              }
-                              val f = File(tmp, a.item.id + "_" + slot + "." + (if (initF != null) "mp4" else plan.ext))
-                              f.outputStream().use { o ->
-                                  if (initF != null) o.write(initF)
-                                  o.write(b)
-                              }
-                              try {
-                                  val bmp = grabFromPath(f.absolutePath)
-                                  if (bmp != null) {
-                                      count.incrementAndGet()
-                                      deliver(a, slot, bmp)
+                              val tries = ArrayList<Int>()
+                              tries.add(si)
+                              if (si + 1 < n) tries.add(si + 1)
+                              if (si - 1 >= 0) tries.add(si - 1)
+                              for (ci in tries) {
+                                  if (a.gen != g || a.cancelled) break
+                                  try {
+                                      val bmp = segFrame(a, plan, h, tmp, slot, ci, initF, keys, err)
+                                      if (bmp != null) {
+                                          count.incrementAndGet()
+                                          deliver(a, g, slot, bmp)
+                                          break
+                                      }
+                                  } catch (e: Exception) {
+                                      Log.d("GreyScript", "frame failed: " + e)
+                                      err.set(e.message ?: "error")
                                   }
-                              } finally {
-                                  f.delete()
                               }
-                          } catch (e: Exception) {
-                              Log.d("GreyScript", "frame failed: " + e)
                           } finally {
                               latch.countDown()
                           }
                       }
                   }
-                  latch.await(60, TimeUnit.SECONDS)
+                  latch.await(75, TimeUnit.SECONDS)
                   return count.get()
               }
 
-              private fun framesFromFile(a: DlAsk): Int {
+              private fun framesFromFile(a: DlAsk, g: Int): Int {
                   val url = a.directUrl
-                  val h = if (a.planHeaders.isNotEmpty()) a.planHeaders else a.item.headers
+                  val h = if (a.planHeaders.isNotEmpty()) a.planHeaders else a.curHeaders
                   val m = MediaMetadataRetriever()
                   var got = 0
                   try {
                       m.setDataSource(url, HashMap<String, String>(h))
                       val durMs = m.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)?.toLongOrNull() ?: 0L
                       if (durMs <= 0L) return 0
-                      Web.postMain { if (a.duration <= 0.0) a.duration = durMs / 1000.0 }
+                      post(a, g) { if (a.duration <= 0.0) a.duration = durMs / 1000.0 }
                       for ((slot, f) in FRACTIONS.withIndex()) {
-                          if (a.cancelled) break
+                          if (a.gen != g || a.cancelled) break
                           val t = (durMs * f * 1000.0).toLong()
                           val bmp = m.getFrameAtTime(t, MediaMetadataRetriever.OPTION_CLOSEST_SYNC) ?: continue
                           val sc = scaleFrame(bmp)
                           got++
-                          deliver(a, slot, sc)
+                          deliver(a, g, slot, sc)
                       }
                   } catch (e: Exception) {
                       Log.d("GreyScript", "file preview failed: " + e)
@@ -3098,7 +3259,46 @@ jobs:
               ref
           }
 
-          fun fetchText(url: String, h: Map<String, String>): String {
+          fun originOfUrl(u: String): String? = try {
+                        val p = android.net.Uri.parse(u)
+                        val sc = p.scheme
+                        val au = p.encodedAuthority
+                        if ((sc == "http" || sc == "https") && !au.isNullOrBlank()) sc + "://" + au else null
+                    } catch (e: Exception) {
+                        null
+                    }
+                    
+                    fun fetchText(url: String, h: Map<String, String>): String {
+                        val tries = ArrayList<Map<String, String>>()
+                        tries.add(h)
+                        val ref = h["Referer"]
+                        val o1 = if (!h["Origin"].isNullOrBlank()) null else originOfUrl(if (!ref.isNullOrBlank()) ref else url)
+                        if (o1 != null) {
+                            val a = HashMap<String, String>(h)
+                            a["Origin"] = o1
+                            if (a["Referer"].isNullOrBlank()) a["Referer"] = o1 + "/"
+                            tries.add(a)
+                        }
+                        val mo = originOfUrl(url)
+                        if (mo != null) {
+                            val b = HashMap<String, String>(h)
+                            b["Origin"] = mo
+                            b["Referer"] = mo + "/"
+                            tries.add(b)
+                        }
+                        var last: Exception? = null
+                        for (t in tries) {
+                            try {
+                                return fetchOnce(url, t)
+                            } catch (e: Exception) {
+                                last = e
+                                if ((e.message ?: "") == "too large") break
+                            }
+                        }
+                        throw last ?: Exception("fetch failed")
+                    }
+                    
+                    fun fetchOnce(url: String, h: Map<String, String>): String {
               val c = java.net.URL(url).openConnection() as java.net.HttpURLConnection
               c.connectTimeout = 15000
               c.readTimeout = 20000
@@ -3274,6 +3474,7 @@ jobs:
                               for (v in items) report(extId, v)
                           } catch (e: Exception) {
                               Log.d("GreyScript", "dash failed: " + url + " " + e)
+                              report(extId, VideoItem(url, "DASH stream", "DASH", "DASH · manifest could not be read", h, 0L))
                           }
                       }.start()
                   } else if (isHls(url, ctype)) {
@@ -3283,6 +3484,7 @@ jobs:
                               for (v in items) report(extId, v)
                           } catch (e: Exception) {
                               Log.d("GreyScript", "hls failed: " + url + " " + e)
+                              report(extId, VideoItem(url, "HLS stream", "HLS", "HLS · playlist could not be read", h, 0L))
                           }
                       }.start()
                   } else {
@@ -3673,13 +3875,41 @@ jobs:
               }
           }
           
-          fun confirmAsk(a: DlAsk, dontAsk: Boolean) {
+          fun confirmAsk(a: DlAsk) {
               a.cancelled = true
               val item = a.finalItem()
-              if (dontAsk) DlPrefs.saveConfirm(false)
               ask = null
               add(item)
+              toast(Web.appCtx, "Added to downloads")
               nextAsk()
+          }
+          
+          private fun isAudioItem(v: VideoItem): Boolean = v.kind == "AUDIO" || v.label.startsWith("Audio")
+          
+          private fun kindOrder(k: String): Int = when (k) {
+              "HLS" -> 0
+              "DASH" -> 1
+              else -> 2
+          }
+          
+          fun openVideos(all: List<VideoItem>, title: String) {
+              if (all.isEmpty()) return
+              val sorted = all.sortedWith(
+                  compareBy<VideoItem> { isAudioItem(it) }.thenBy { kindOrder(it.kind) }.thenByDescending { it.rank }
+              )
+              val def = sorted.firstOrNull { !isAudioItem(it) } ?: sorted[0]
+              val nt = niceTitle(title, def.url)
+              val d = buildVideo(def, nt, all)
+              val sz = if (def.kind != "HLS" && def.kind != "DASH" && def.rank > 0L) def.rank else -1L
+              main.post {
+                  val a = DlAsk(d, DlInfo(def.url, "", sz, def, sorted, nt))
+                  if (ask == null) {
+                      ask = a
+                      FramePreview.inspect(a)
+                  } else {
+                      askQueue.add(a)
+                  }
+              }
           }
           
           fun cancelConfirm(a: DlAsk) {
@@ -8144,7 +8374,7 @@ jobs:
                           .clip(shape)
                           .background(Bar)
                           .border(0.5.dp, Color(0xFF555555), shape)
-                          .clickable { onToggle() }
+                          .clickable { Downloads.openVideos(videos, title) }
                           .padding(horizontal = 10.dp, vertical = 12.dp),
                       horizontalAlignment = Alignment.CenterHorizontally
                   ) {
